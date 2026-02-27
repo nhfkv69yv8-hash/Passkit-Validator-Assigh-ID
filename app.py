@@ -141,7 +141,7 @@ def is_blank_card_number(v) -> bool:
 
 def extract_member_rows(list_response_items: list[dict], search_name: str, max_hits: int) -> list[dict]:
     """
-    Extract: person.displayName, id, passStatus, meta.meta_cardNumber, created/updated(若有)
+    Extract: person.displayName, id, passStatus, meta.cardNumber, created/updated(若有)
     """
     rows = []
     for item in list_response_items:
@@ -158,7 +158,7 @@ def extract_member_rows(list_response_items: list[dict], search_name: str, max_h
         member_id = (member.get("id") or "").strip()
         pass_status = (member.get("passStatus") or "").strip()
 
-        meta_card_number = meta.get("meta_cardNumber")
+        meta_card_number = meta.get("cardNumber")
         meta_card_number = "" if meta_card_number is None else str(meta_card_number).strip()
 
         created = member.get("created") or member.get("createdAt") or member.get("createdOn")
@@ -170,7 +170,7 @@ def extract_member_rows(list_response_items: list[dict], search_name: str, max_h
                 "displayName": display_name,
                 "memberId": member_id,
                 "passStatus": pass_status,
-                "meta_cardNumber": meta_card_number,
+                "cardNumber": card_number,
                 "created": str(created) if created is not None else "",
                 "updated": str(updated) if updated is not None else "",
             })
@@ -198,7 +198,7 @@ def search_by_display_name(name: str, max_hits: int, operator: str) -> list[dict
 def list_recycle_pool_issued_cardnumber_null(limit: int = 300, offset: int = 0) -> list[dict]:
     """
     全域回收池（可選）：
-    PASS_ISSUED 且 meta_cardNumber == NULL 的 memberId
+    PASS_ISSUED 且 cardNumber == NULL 的 memberId
     - 有些 PassKit 後端會用 "NULL" 當作 null filterValue
     - 這裡也做二次檢查：回來後再用 is_blank_card_number() 過濾
     """
@@ -209,7 +209,7 @@ def list_recycle_pool_issued_cardnumber_null(limit: int = 300, offset: int = 0) 
             "condition": "AND",
             "fieldFilters": [
                 {"filterField": "passStatus", "filterValue": "PASS_ISSUED", "filterOperator": "eq"},
-                {"filterField": "meta_cardNumber", "filterValue": "NULL", "filterOperator": "eq"},
+                {"filterField": "cardNumber", "filterValue": "NULL", "filterOperator": "eq"},
             ]
         }],
         "orderBy": "created",
@@ -228,13 +228,13 @@ def list_recycle_pool_issued_cardnumber_null(limit: int = 300, offset: int = 0) 
 
         mid = (member.get("id") or "").strip()
         ps = (member.get("passStatus") or "").strip()
-        mcn = meta.get("meta_cardNumber")
+        mcn = meta.get("cardNumber")
 
         if mid and ps == "PASS_ISSUED" and is_blank_card_number(mcn):
             pool.append({
                 "memberId": mid,
                 "passStatus": ps,
-                "meta_cardNumber": "" if mcn is None else str(mcn).strip(),
+                "cardNumber": "" if mcn is None else str(mcn).strip(),
                 "created": str(member.get("created") or ""),
             })
     return pool
@@ -270,7 +270,7 @@ def choose_duplicate_recycle_candidates(df_hits: pd.DataFrame) -> pd.DataFrame:
         rest = g_sorted.iloc[1:]
 
         for _, r in rest.iterrows():
-            if (r.get("passStatus") == "PASS_ISSUED") and is_blank_card_number(r.get("meta_cardNumber")):
+            if (r.get("passStatus") == "PASS_ISSUED") and is_blank_card_number(r.get("cardNumber")):
                 candidates.append(r.to_dict())
 
     return pd.DataFrame(candidates) if candidates else work.iloc[0:0].copy()
@@ -286,7 +286,7 @@ def build_put_payload_reassign(member_id: str, new_display_name: str) -> dict:
         "programId": PROGRAM_ID,
         "id": member_id,
         "person": {"displayName": new_display_name},
-        "meta": {"meta_cardNumber": f"TEMP_{member_id}"},
+        "meta": {"cardNumber": f"TEMP_{member_id}"},
     }
 
 # ----------------------------
@@ -394,7 +394,7 @@ elif submitted:
 # Recycle & assign
 # ----------------------------
 st.divider()
-st.header("♻️ 回收池 → 分配給 missing（條件：PASS_ISSUED + meta.meta_cardNumber 為空）")
+st.header("♻️ 回收池 → 分配給 missing（條件：PASS_ISSUED + meta.cardNumber 為空）")
 
 if not missing_names:
     st.info("目前沒有 missing 名單，因此不需要分配回收池。")
