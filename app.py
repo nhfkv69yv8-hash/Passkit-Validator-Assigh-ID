@@ -3,16 +3,28 @@ import time
 import json
 import hashlib
 import requests
-import jwt  # from PyJWT
+import jwt  # PyJWT
 import pandas as pd
 import streamlit as st
+
+# ============================================================
+# PassKit 重複 ID 搜尋 / 回收分配工具（meta.meta_cardNumber 版）
+# - 查詢：用 person.displayName 找 memberId
+# - 找出：同名多筆 / 未找到
+# - 回收：PASS_ISSUED 且 meta.meta_cardNumber 為空（或 NULL）
+# - 分配：把回收的 memberId 改名給 missing 名單（PUT 更新）
+# ============================================================
 
 # ----------------------------
 # Page
 # ----------------------------
-st.set_page_config(page_title="PassKit 重複 ID 搜尋 / 回收分配工具", page_icon="♻️", layout="wide")
+st.set_page_config(
+    page_title="PassKit 重複 ID 搜尋 / 回收分配工具",
+    page_icon="♻️",
+    layout="wide",
+)
 st.title("♻️ PassKit 重複 ID 搜尋 / 回收分配工具")
-st.caption("1) 用 displayName 查詢 memberId 2) 找重複/未找到 3) 回收 PASS_ISSUED 且 meta_cardNumber 為空的舊 memberId 分配給未找到名單（先 Dry-run 再 Apply）")
+st.caption("回收條件：PASS_ISSUED + meta.meta_cardNumber 為空（或 NULL）。先 Dry-run 預覽 mapping，再 Apply 批次 PUT。")
 
 # ----------------------------
 # Config helpers
@@ -30,6 +42,9 @@ PK_API_SECRET = get_config("PK_API_SECRET")
 PK_API_PREFIX = get_config("PK_API_PREFIX", "https://api.pub1.passkit.io")
 PROGRAM_ID = get_config("PROGRAM_ID")
 
+# ✅ 你的 cardNumber 欄位：meta.meta_cardNumber
+CARDNUMBER_META_KEY = "meta_cardNumber"
+
 missing_cfg = [k for k, v in {
     "PK_API_KEY": PK_API_KEY,
     "PK_API_SECRET": PK_API_SECRET,
@@ -38,7 +53,7 @@ missing_cfg = [k for k, v in {
 }.items() if not v]
 
 if missing_cfg:
-    st.error(f"❌ 缺少設定：{', '.join(missing_cfg)}（請在 .env 或 Secrets 補上）")
+    st.error(f"❌ 缺少設定：{', '.join(missing_cfg)}（請在 .env 或 Streamlit Secrets 補上）")
     st.stop()
 
 # ----------------------------
@@ -49,7 +64,7 @@ def make_jwt_for_body(body_text: str) -> str:
     payload = {
         "uid": PK_API_KEY,
         "iat": now,
-        "exp": now + 600,
+        "exp": now + 600,  # 10 minutes
     }
     if body_text:
         payload["signature"] = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
@@ -63,10 +78,15 @@ def _handle_resp_errors(resp: requests.Response) -> None:
     if resp.status_code == 404:
         raise RuntimeError("404 Not Found：多半是 API Prefix（pub1/pub2）或 endpoint path 用錯。")
     if resp.status_code in (401, 403):
-        raise RuntimeError(f"Auth 失敗（{resp.status_code}）：請確認 PK_API_KEY/PK_API_SECRET、以及 API Prefix（pub1/pub2）。")
+        raise RuntimeError(
+            f"Auth 失敗（{resp.status_code}）：請確認 PK_API_KEY/PK_API_SECRET、以及 API Prefix（pub1/pub2）。"
+        )
     if not resp.ok:
-        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:800]}")
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:1000]}")
 
+# ----------------------------
+# PassKit API calls
+# ----------------------------
 def post_list_members(filters_payload: dict) -> list[dict]:
     """
     POST {PK_API_PREFIX}/members/member/list/{PROGRAM_ID}
@@ -89,7 +109,6 @@ def post_list_members(filters_payload: dict) -> list[dict]:
         return []
 
     items: list[dict] = []
-    # Try NDJSON first
     lines = [ln for ln in text.split("\n") if ln.strip()]
     for ln in lines:
         try:
@@ -100,40 +119,45 @@ def post_list_members(filters_payload: dict) -> list[dict]:
             break
     return items
 
-def put_update_member_reassign(member_id: str, new_display_name: str) -> dict:
-    new_display_name = (new_display_name or "").strip()
-    placeholder = f"TEMP_{member_id}"
+def put_update_member(payload: dict) -> dict:
+    """
+    PUT {PK_API_PREFIX}/members/member
+    """
+    url = f"{PK_API_PREFIX.rstrip('/')}/members/member"
+    body_text = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
-    # A) nested payload（你現在 list 回傳是 meta，所以先用這個）
-    payload_a = {
-        "programId": PROGRAM_ID,
-        "id": member_id,
-        "person": {"displayName": new_display_name},
-        "meta": {CARDNUMBER_META_KEY: placeholder},
+    token = make_jwt_for_body(body_text)
+    headers = {
+        "Authorization": token,
+        "Content-Type": "application/json",
     }
 
+    resp = requests.put(url, headers=headers, data=body_text, timeout=30)
+    _handle_resp_errors(resp)
+
     try:
-        return put_update_member(payload_a)
+        return resp.json()
     except Exception:
-        # B) dot-key payload（有些帳號/版本偏好這種寫法）
-        payload_b = {
-            "programId": PROGRAM_ID,
-            "id": member_id,
-            "person.displayName": new_display_name,
-            f"meta.{CARDNUMBER_META_KEY}": placeholder,
-        }
-        return put_update_member(payload_b)
+        return {"ok": True, "text": resp.text[:1000]}
 
 # ----------------------------
-# Helpers
+# Data helpers
 # ----------------------------
-def normalize_name(name: str) -> str:
-    # 你說 displayName 固定全大寫 first+last、無空格；這裡只做基本 trim
-    return (name or "").strip()
-
 def extract_member_obj(item: dict) -> dict | None:
     member = item.get("result") or item.get("member") or item
     return member if isinstance(member, dict) else None
+
+def _get_meta_container(member: dict) -> dict:
+    """
+    你回傳的容器 key 是 meta。
+    同時做相容：若未來回傳改成 metaData/metadata，也不會壞。
+    """
+    meta = member.get("meta")
+    if not isinstance(meta, dict):
+        meta = member.get("metaData")
+    if not isinstance(meta, dict):
+        meta = member.get("metadata")
+    return meta if isinstance(meta, dict) else {}
 
 def is_blank(v) -> bool:
     if v is None:
@@ -141,25 +165,25 @@ def is_blank(v) -> bool:
     s = str(v).strip()
     return (s == "") or (s.upper() == "NULL")
 
-def is_recyclable(row: dict) -> bool:
-    return (row.get("passStatus") == "PASS_ISSUED") and is_blank(row.get("meta_cardNumber"))
-    
-def _get_meta_container(member: dict) -> dict:
-    # 你實際回傳是 meta，但官方文件也常見 metaData；做相容處理
-    meta = member.get("meta")
-    if not isinstance(meta, dict) or meta is None:
-        meta = member.get("metaData")
-    if not isinstance(meta, dict) or meta is None:
-        meta = member.get("metadata")
-    return meta if isinstance(meta, dict) else {}
-
-CARDNUMBER_META_KEY = "meta_cardNumber"  # 你的 field key
+def normalize_name(s: str, remove_spaces: bool) -> str:
+    s = (s or "").strip()
+    if remove_spaces:
+        s = s.replace(" ", "")
+    return s
 
 def extract_member_rows(list_response_items: list[dict], search_name: str, max_hits: int) -> list[dict]:
+    """
+    Extract:
+      - person.displayName
+      - member.id
+      - passStatus
+      - meta.meta_cardNumber
+      - created/updated (若存在)
+    """
     rows = []
     for item in list_response_items:
-        member = item.get("result") or item.get("member") or item
-        if not isinstance(member, dict):
+        member = extract_member_obj(item)
+        if not member:
             continue
 
         person = member.get("person") or {}
@@ -172,14 +196,14 @@ def extract_member_rows(list_response_items: list[dict], search_name: str, max_h
         meta_card_number = meta.get(CARDNUMBER_META_KEY)
         meta_card_number = "" if meta_card_number is None else str(meta_card_number).strip()
 
-        created = member.get("created") or ""
-        updated = member.get("updated") or ""
+        created = member.get("created") or member.get("createdAt") or member.get("createdOn") or ""
+        updated = member.get("updated") or member.get("updatedAt") or member.get("updatedOn") or ""
 
         if display_name and member_id:
             rows.append({
                 "搜尋姓名": search_name,
-                "displayName (person.displayName)": display_name,
-                "memberId (member.id)": member_id,
+                "displayName": display_name,
+                "memberId": member_id,
                 "passStatus": pass_status,
                 "meta_cardNumber": meta_card_number,
                 "created": str(created),
@@ -199,27 +223,34 @@ def search_by_display_name(name: str, max_hits: int, operator: str) -> list[dict
             "fieldFilters": [{
                 "filterField": "displayName",
                 "filterValue": name,
-                "filterOperator": operator,  # "eq" or "like"
+                "filterOperator": operator,  # eq / like
             }]
         }]
     }
     items = post_list_members(filters)
     return extract_member_rows(items, name, max_hits=max_hits)
 
-list_recycle_pool
+# ----------------------------
+# Recycle pool logic
+# ----------------------------
+def is_recyclable_row(row: dict) -> bool:
+    """
+    回收條件（你指定）：
+      - PASS_ISSUED
+      - meta_cardNumber 為空/NULL
+    """
+    return (row.get("passStatus") == "PASS_ISSUED") and is_blank(row.get("meta_cardNumber"))
 
 def choose_duplicate_recycle_candidates(df_hits: pd.DataFrame) -> pd.DataFrame:
     """
     從同名多筆中挑回收候選：
-    - 每個 displayName 保留 1 筆（當成最新/主筆）
-    - 其餘若 passStatus=PASS_ISSUED 且 meta_cardNumber 空 → 回收池
+      - 每個 displayName 保留最新 1 筆（updated/created 盡量判斷）
+      - 其餘若 PASS_ISSUED + meta_cardNumber 空 → 回收池
     """
     if df_hits.empty:
         return df_hits.iloc[0:0].copy()
 
     work = df_hits.copy()
-
-    # created/updated 若可解析就排序更穩
     for col in ["updated", "created"]:
         if col in work.columns:
             work[col] = pd.to_datetime(work[col], errors="coerce")
@@ -229,43 +260,115 @@ def choose_duplicate_recycle_candidates(df_hits: pd.DataFrame) -> pd.DataFrame:
         if len(g) <= 1:
             continue
 
-        # newest first（updated > created）
+        # newest first
         if g["updated"].notna().any() or g["created"].notna().any():
             g_sorted = g.sort_values(["updated", "created"], ascending=[False, False], na_position="last")
         else:
             g_sorted = g.copy()
 
-        # keep newest (first row)
+        # keep newest (first)
         rest = g_sorted.iloc[1:]
-
         for _, r in rest.iterrows():
-            if (r.get("passStatus") == "PASS_ISSUED") and is_blank_card_number(r.get("meta_cardNumber")):
+            if is_recyclable_row(r.to_dict()):
                 candidates.append(r.to_dict())
 
     return pd.DataFrame(candidates) if candidates else work.iloc[0:0].copy()
 
-def build_put_payload_reassign(member_id: str, new_display_name: str) -> dict:
+def list_recycle_pool_global(limit: int = 300, offset: int = 0) -> list[dict]:
     """
-    回收分配時：
-    - 更新 person.displayName
-    - 同時寫入佔位 meta_cardNumber，避免下一次又被當成可回收
+    全域回收池（不依賴你輸入的名字）：
+      - passStatus == PASS_ISSUED
+      - meta_cardNumber == NULL
+
+    注意：某些環境可能不支援用 filterField 直接對自訂 meta 欄位做 NULL 過濾。
+    若撈不到，你可以改用 B 模式（同名重複回收）或先擴大 input 做查詢。
     """
-    new_display_name = normalize_name(new_display_name)
-    return {
+    def _call_with_field(field_name: str) -> list[dict]:
+        filters = {
+            "limit": min(int(limit), 1000),
+            "offset": int(offset),
+            "orderBy": "created",
+            "orderAsc": True,
+            "filterGroups": [{
+                "condition": "AND",
+                "fieldFilters": [
+                    {"filterField": "passStatus", "filterValue": "PASS_ISSUED", "filterOperator": "eq"},
+                    {"filterField": field_name, "filterValue": "NULL", "filterOperator": "eq"},
+                ]
+            }]
+        }
+        items = post_list_members(filters)
+        pool = []
+        for item in items:
+            member = extract_member_obj(item)
+            if not member:
+                continue
+            meta = _get_meta_container(member)
+            mid = (member.get("id") or "").strip()
+            ps = (member.get("passStatus") or "").strip()
+            mcn = meta.get(CARDNUMBER_META_KEY)
+            if mid and ps == "PASS_ISSUED" and is_blank(mcn):
+                pool.append({
+                    "memberId": mid,
+                    "passStatus": ps,
+                    "meta_cardNumber": "" if mcn is None else str(mcn).strip(),
+                    "created": str(member.get("created") or ""),
+                })
+        return pool
+
+    # 先用你定義的 field key：meta_cardNumber
+    pool = _call_with_field(CARDNUMBER_META_KEY)
+    if pool:
+        return pool
+
+    # 若後端需要完整路徑（某些實作會用 meta.meta_cardNumber）
+    pool = _call_with_field(f"meta.{CARDNUMBER_META_KEY}")
+    return pool
+
+def build_update_payload(member_id: str, new_display_name: str, write_placeholder: bool) -> dict:
+    """
+    分配時 PUT 更新：
+      - person.displayName = new_display_name
+      - meta.meta_cardNumber = TEMP_{member_id}（可關閉）
+    """
+    payload = {
         "programId": PROGRAM_ID,
         "id": member_id,
         "person": {"displayName": new_display_name},
-        "meta": {"meta_cardNumber": f"TEMP_{member_id}"},
     }
+    if write_placeholder:
+        payload["meta"] = {CARDNUMBER_META_KEY: f"TEMP_{member_id}"}
+    return payload
+
+def put_reassign(member_id: str, new_display_name: str, write_placeholder: bool) -> dict:
+    """
+    先用 nested 形式（person/meta）。
+    若你帳號的 update endpoint 偏好 dot-key，失敗則 fallback。
+    """
+    new_display_name = (new_display_name or "").strip()
+
+    payload_a = build_update_payload(member_id, new_display_name, write_placeholder)
+    try:
+        return put_update_member(payload_a)
+    except Exception:
+        # fallback: dot-key
+        payload_b = {
+            "programId": PROGRAM_ID,
+            "id": member_id,
+            "person.displayName": new_display_name,
+        }
+        if write_placeholder:
+            payload_b[f"meta.{CARDNUMBER_META_KEY}"] = f"TEMP_{member_id}"
+        return put_update_member(payload_b)
 
 # ----------------------------
-# UI
+# UI - Search
 # ----------------------------
 with st.form("search_form"):
     input_text = st.text_area(
-        "每行一個 full name（PassKit: person.displayName）— 最多 150 行",
+        "每行一個 displayName（person.displayName）— 最多 150 行",
         height=220,
-        placeholder="MEIHUA LEE\nHSIUTING CHOU\nKUANYEN LEE\n..."
+        placeholder="MEIHUA LEE\nHSIUTING CHOU\nKUANYEN LEE\n...",
     )
 
     colA, colB, colC, colD = st.columns([1, 1, 1, 2])
@@ -276,12 +379,14 @@ with st.form("search_form"):
     with colC:
         throttle = st.number_input("每次 API 間隔秒數", min_value=0.0, max_value=2.0, value=0.15, step=0.05)
     with colD:
-        st.caption("eq = 完全相同；like = 包含（較鬆，可能會回更多結果）")
+        remove_spaces = st.checkbox("查詢前移除空格", value=False)
+        st.caption("若你的 displayName 真的是全大寫且無空格，可勾選提升命中。")
 
     submitted = st.form_submit_button("Search")
 
 if submitted:
-    names = [normalize_name(n) for n in (input_text or "").splitlines() if normalize_name(n)]
+    raw_names = [n for n in (input_text or "").splitlines() if n.strip()]
+    names = [normalize_name(n, remove_spaces=remove_spaces) for n in raw_names if normalize_name(n, remove_spaces)]
     if not names:
         st.warning("請先貼上至少一行姓名。")
         st.stop()
@@ -290,8 +395,8 @@ if submitted:
         st.warning(f"你貼了 {len(names)} 行，系統只會取前 150 行。")
         names = names[:150]
 
-    all_rows = []
-    missing = []
+    all_rows: list[dict] = []
+    missing: list[str] = []
 
     prog = st.progress(0.0)
     status = st.empty()
@@ -350,8 +455,8 @@ if hits_rows:
         st.metric("同名重複名稱數", int(len(dup_only)))
         st.dataframe(dup_only, use_container_width=True, height=260)
 
+        st.subheader("未找到名單（missing）")
         if missing_names:
-            st.subheader("未找到名單（missing）")
             st.write("\n".join(missing_names))
         else:
             st.info("沒有 missing。")
@@ -363,15 +468,15 @@ elif submitted:
 # Recycle & assign
 # ----------------------------
 st.divider()
-st.header("♻️ 回收池 → 分配給 missing（條件：PASS_ISSUED + meta.meta_cardNumber 為空）")
+st.header("♻️ 回收池 → 分配給 missing（PASS_ISSUED + meta_cardNumber 空）")
 
 if not missing_names:
     st.info("目前沒有 missing 名單，因此不需要分配回收池。")
 else:
     st.warning(
-        "⚠️ 重要提醒：你目前沒有『Pass URL 是否曾發送/外流』的紀錄。\n\n"
+        "⚠️ 重要提醒：你目前沒有『Pass URL 是否曾發送/外流』的紀錄。\n"
         "PASS_ISSUED 代表 URL 已存在；即使未 installed，若 URL 曾外流，你把 memberId 改名給別人，等於轉手。\n"
-        "你要求的是過渡期減輕人工檢查，所以此工具用『PASS_ISSUED + meta_cardNumber 空』做保守回收。"
+        "此工具依你的要求：以『PASS_ISSUED + meta_cardNumber 空』做回收條件，並提供 Dry-run→Apply 兩段式避免誤操作。"
     )
 
     mode = st.radio(
@@ -380,16 +485,18 @@ else:
             "A) 全域回收池：PASS_ISSUED + meta_cardNumber 為空（不依賴重複查詢）",
             "B) 同名重複回收：每個 displayName 保留最新 1 筆，其餘符合條件者回收（更貼近你截圖情境）",
         ],
-        index=1
+        index=1,
     )
 
-    col1, col2, col3 = st.columns([1, 1, 2])
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
     with col1:
         assign_limit = st.number_input("最多分配筆數", min_value=1, max_value=5000, value=min(300, len(missing_names)), step=10)
     with col2:
         apply_throttle = st.number_input("每次 PUT 間隔秒數", min_value=0.0, max_value=2.0, value=0.2, step=0.05)
     with col3:
-        st.caption("流程：先 Dry-run 產生 mapping → 勾選確認 → Apply 批次 PUT。")
+        write_placeholder = st.checkbox("Apply 時寫入佔位 meta_cardNumber（建議開）", value=True)
+    with col4:
+        st.caption("若不寫佔位，該筆仍會被判定為『cardNumber 空』，下次可能再次被回收。")
 
     recycle_ids: list[str] = []
 
@@ -399,7 +506,7 @@ else:
         fetch_pool = st.button("取得回收池（A）", type="secondary")
         if fetch_pool:
             try:
-                pool = list_recycle_pool_issued_cardnumber_null(limit=int(pool_limit), offset=0)
+                pool = list_recycle_pool_global(limit=int(pool_limit), offset=0)
                 st.session_state["recycle_pool_A"] = pool
                 st.success(f"回收池取得完成：{len(pool)} 筆。")
             except Exception as e:
@@ -411,7 +518,7 @@ else:
             st.dataframe(df_pool, use_container_width=True, height=260)
             recycle_ids = [x["memberId"] for x in pool if x.get("memberId")]
         else:
-            st.info("尚未取得回收池，或回收池為空。")
+            st.info("尚未取得回收池，或回收池為空（可能是後端不支援對自訂欄位做 NULL filter）。")
 
     else:
         st.subheader("B) 從同名重複中挑回收候選（保留最新 1 筆，其餘 PASS_ISSUED + meta_cardNumber 空者回收）")
@@ -445,7 +552,7 @@ else:
             "下載 mapping CSV（Dry-run）",
             data=df_map.to_csv(index=False).encode("utf-8-sig"),
             file_name="recycle_mapping_dryrun.csv",
-            mime="text/csv"
+            mime="text/csv",
         )
 
         st.divider()
@@ -453,7 +560,7 @@ else:
 
         ack = st.checkbox(
             "我了解風險：PASS_ISSUED 仍可能已被分享。若回收的 memberId/URL 曾外流，更新後會讓舊 URL 指向新會員資料（等於轉手）。",
-            value=False
+            value=False,
         )
         do_apply = st.button("Apply 批次更新", type="primary", disabled=not ack)
 
@@ -471,8 +578,7 @@ else:
                 status2.info(f"更新中 {i}/{len(mapping)}：{member_id} → {new_name}")
 
                 try:
-                    payload = build_put_payload_reassign(member_id, new_name)
-                    resp = put_update_member(payload)
+                    resp = put_reassign(member_id, new_name, write_placeholder=write_placeholder)
                     ok_rows.append({
                         "memberId": member_id,
                         "new_displayName": new_name,
@@ -484,7 +590,7 @@ else:
                         "memberId": member_id,
                         "new_displayName": new_name,
                         "result": "FAIL",
-                        "error": str(e)[:800],
+                        "error": str(e)[:1000],
                     })
 
                 prog2.progress(i / len(mapping))
@@ -504,7 +610,7 @@ else:
                     "下載成功 CSV",
                     data=df_ok.to_csv(index=False).encode("utf-8-sig"),
                     file_name="recycle_apply_success.csv",
-                    mime="text/csv"
+                    mime="text/csv",
                 )
 
             if fail_rows:
@@ -515,5 +621,5 @@ else:
                     "下載失敗 CSV",
                     data=df_fail.to_csv(index=False).encode("utf-8-sig"),
                     file_name="recycle_apply_failed.csv",
-                    mime="text/csv"
+                    mime="text/csv",
                 )
