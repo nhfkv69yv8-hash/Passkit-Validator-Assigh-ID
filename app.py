@@ -19,148 +19,200 @@ st.caption("自動識別重複 ID、建立持久化回收池，並分配給缺�
 # Session State 初始化 (持久化存儲)
 # ----------------------------
 if "persistent_recycle_pool" not in st.session_state:
-    st.session_state.persistent_recycle_pool = []  # 真正的「彈藥庫」
+    st.session_state.persistent_recycle_pool = []  # 跨搜尋的「彈藥庫」
 
 if "search_results" not in st.session_state:
     st.session_state.search_results = {"all_rows": [], "missing": [], "search_done": False}
 
 # ----------------------------
-# API Functions (與之前相同，略過重複定義以節省篇幅，請保留你原本的定義)
+# Config helpers
 # ----------------------------
-# [保留 make_jwt_for_body, post_list_members, search_by_display_name, update_member_display_name]
+def get_config(key: str, default: str | None = None) -> str | None:
+    val = st.secrets.get(key) if hasattr(st, "secrets") else None
+    if val is None:
+        val = os.environ.get(key, default)
+    if val is None:
+        return None
+    return str(val).replace("\\n", "\n").strip()
 
-# --- 這裡僅補上 update_member_display_name 以確保邏輯完整 ---
+PK_API_KEY = get_config("PK_API_KEY")
+PK_API_SECRET = get_config("PK_API_SECRET")
+PK_API_PREFIX = get_config("PK_API_PREFIX", "https://api.pub1.passkit.io")
+PROGRAM_ID = get_config("PROGRAM_ID")
+
+missing_cfg = [k for k, v in {
+    "PK_API_KEY": PK_API_KEY,
+    "PK_API_SECRET": PK_API_SECRET,
+    "PK_API_PREFIX": PK_API_PREFIX,
+    "PROGRAM_ID": PROGRAM_ID
+}.items() if not v]
+
+if missing_cfg:
+    st.error(f"❌ 缺少設定：{', '.join(missing_cfg)}")
+    st.stop()
+
+# ----------------------------
+# API Functions (核心函式，不可省略)
+# ----------------------------
+def make_jwt_for_body(body_text: str) -> str:
+    now = int(time.time())
+    payload = {"uid": PK_API_KEY, "iat": now, "exp": now + 600}
+    if body_text:
+        payload["signature"] = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
+    token = jwt.encode(payload, PK_API_SECRET, algorithm="HS256")
+    return token.decode("utf-8") if isinstance(token, bytes) else token
+
+def post_list_members(filters_payload: dict) -> list[dict]:
+    url = f"{PK_API_PREFIX.rstrip('/')}/members/member/list/{PROGRAM_ID}"
+    body_text = json.dumps({"filters": filters_payload}, separators=(",", ":"), ensure_ascii=False)
+    headers = {"Authorization": make_jwt_for_body(body_text), "Content-Type": "application/json"}
+    resp = requests.post(url, headers=headers, data=body_text, timeout=30)
+    if not resp.ok: raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:500]}")
+    text = resp.text.strip()
+    if not text: return []
+    items = []
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    for ln in lines:
+        try: items.append(json.loads(ln))
+        except: items = [json.loads(text)]; break
+    return items
+
+def search_by_display_name(name: str, max_hits: int, operator: str) -> list[dict]:
+    filters = {
+        "limit": min(max_hits, 1000),
+        "offset": 0,
+        "filterGroups": [{
+            "condition": "AND",
+            "fieldFilters": [{"filterField": "displayName", "filterValue": name, "filterOperator": operator}]
+        }]
+    }
+    items = post_list_members(filters)
+    rows = []
+    for item in items:
+        member = item.get("result") or item.get("member") or item
+        person = member.get("person") or {}
+        d_name = (person.get("displayName") or "").strip()
+        m_id = (member.get("id") or "").strip()
+        if d_name and m_id:
+            rows.append({"搜尋姓名": name, "displayName": d_name, "memberId": m_id})
+    return rows[:max_hits]
+
 def update_member_display_name(member_id: str, new_name: str) -> bool:
     url = f"{PK_API_PREFIX.rstrip('/')}/members/member"
     payload = {"id": member_id, "person": {"displayName": new_name}}
     body_text = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-    token = make_jwt_for_body(body_text)
-    headers = {"Authorization": token, "Content-Type": "application/json"}
+    headers = {"Authorization": make_jwt_for_body(body_text), "Content-Type": "application/json"}
     resp = requests.put(url, headers=headers, data=body_text, timeout=30)
     return resp.ok
 
 # ----------------------------
-# UI 搜尋區
+# UI 與 邏輯控制
 # ----------------------------
 with st.sidebar:
-    st.header("⚙️ 設定與管理")
-    if st.button("🗑️ 清空暫存回收池"):
+    st.header("⚙️ 管理面板")
+    st.metric("📦 暫存池剩餘 ID", len(st.session_state.persistent_recycle_pool))
+    if st.button("🗑️ 清空所有暫存 ID"):
         st.session_state.persistent_recycle_pool = []
-        st.success("暫存池已清空")
         st.rerun()
-    
-    st.metric("📦 目前暫存 ID 數量", len(st.session_state.persistent_recycle_pool))
 
 with st.form("search_form"):
-    input_text = st.text_area("輸入會員姓名 (每行一個)", height=150)
+    input_text = st.text_area("會員名單 (每行一個姓名)", height=150, placeholder="MEIHUA LEE\nTI SU")
     colA, colB = st.columns(2)
-    max_hits = colA.number_input("同名最多筆數", 1, 100, 5)
+    max_hits = colA.number_input("同名最多抓取筆數", 1, 150, 5)
     operator = colB.selectbox("比對方式", ["eq", "like"])
-    submitted = st.form_submit_button("開始搜尋並盤點資源")
+    submitted = st.form_submit_button("🔍 執行資源盤點")
 
 if submitted:
     names = [n.strip() for n in (input_text or "").splitlines() if n.strip()]
-    if not names: st.stop()
+    if not names: st.warning("請輸入姓名"); st.stop()
 
     all_rows, missing = [], []
     prog = st.progress(0)
+    status_txt = st.empty()
     
     for i, name in enumerate(names):
+        status_txt.text(f"查詢中 ({i+1}/{len(names)}): {name}")
         try:
             rows = search_by_display_name(name, max_hits=int(max_hits), operator=operator)
             if rows: all_rows.extend(rows)
             else: missing.append(name)
         except Exception as e:
-            st.error(f"查詢失敗: {name} - {e}")
+            st.error(f"查詢出錯: {name} -> {e}")
         prog.progress((i + 1) / len(names))
 
-    # --- 關鍵去重與回收邏輯 ---
-    # 1. 實體去重 (解決你提到的 TI SU 同 ID 出現兩次的問題)
+    # --- 核心邏輯：驗證實體 ID 唯一性 ---
     unique_records = []
     seen_ids = set()
     for r in all_rows:
-        if r["memberId (member.id)"] not in seen_ids:
+        if r["memberId"] not in seen_ids:
             unique_records.append(r)
-            seen_ids.add(r["memberId (member.id)"])
+            seen_ids.add(r["memberId"])
 
-    # 2. 找出真正重複的 ID (同名但不同 ID)
     member_groups = defaultdict(list)
     for r in unique_records:
-        member_groups[r["搜尋姓名"]].append(r["memberId (member.id)"])
+        member_groups[r["搜尋姓名"]].append(r["memberId"])
 
     new_recycle_ids = []
     for ids in member_groups.values():
         if len(ids) > 1:
-            new_recycle_ids.extend(ids[:-1]) # 保留最後一個，其餘回收
+            new_recycle_ids.extend(ids[:-1]) # 僅回收重複出的 ID，保留最後一個
 
-    # 3. 合併入持久化回收池 (去重合併)
-    current_pool = set(st.session_state.persistent_recycle_pool)
-    current_pool.update(new_recycle_ids)
-    st.session_state.persistent_recycle_pool = list(current_pool)
+    # 合併入持久化彈藥庫 (確保 ID 不重複存入)
+    updated_pool = set(st.session_state.persistent_recycle_pool)
+    updated_pool.update(new_recycle_ids)
+    st.session_state.persistent_recycle_pool = list(updated_pool)
 
-    # 存入結果
-    st.session_state.search_results = {
-        "all_rows": all_rows,
-        "missing": missing,
-        "search_done": True
-    }
+    st.session_state.search_results = {"all_rows": all_rows, "missing": missing, "search_done": True}
+    st.rerun()
 
 # ----------------------------
-# 顯示結果與指派功能
+# 顯示結果與執行指派
 # ----------------------------
 res = st.session_state.search_results
 if res["search_done"]:
-    st.subheader("📊 本次搜尋結果")
+    st.success(f"盤點完成！本次命中 {len(res['all_rows'])} 筆，缺額 {len(res['missing'])} 人。")
+    
     col1, col2 = st.columns(2)
-    col1.write(f"✅ 命中筆數: {len(res['all_rows'])}")
-    col2.write(f"❓ 未找到人數: {len(res['missing'])}")
-
-    if res["missing"]:
-        with st.expander("查看未找到名單"):
-            st.write(", ".join(res["missing"]))
+    with col1:
+        st.subheader("📋 命中資料明細")
+        st.dataframe(pd.DataFrame(res["all_rows"]), use_container_width=True)
+    with col2:
+        st.subheader("❓ 缺額名單")
+        st.write(", ".join(res["missing"]) if res["missing"] else "無缺額")
 
     st.markdown("---")
-    st.subheader("🚀 資源回收指派作業")
+    st.subheader("🚀 回收池指派作業")
     
     pool = st.session_state.persistent_recycle_pool
     missing_list = res["missing"]
     
-    st.info(f"庫存可用 ID：**{len(pool)}** 個 | 等待分配人數：**{len(missing_list)}** 人")
+    st.info(f"當前彈藥庫可用：**{len(pool)}** 個 ID | 本次待指派：**{len(missing_list)}** 人")
 
     if pool and missing_list:
         pair_count = min(len(pool), len(missing_list))
+        preview = [{"回收 ID": pool[i], "分配給": missing_list[i]} for i in range(pair_count)]
         
-        # 預覽配對
-        preview_data = []
-        for i in range(pair_count):
-            preview_data.append({"回收 ID": pool[i], "指派給新會員": missing_list[i]})
-        
-        st.table(preview_data[:10]) # 僅顯示前 10 筆預覽
-        if pair_count > 10: st.write(f"...等共 {pair_count} 筆配對")
+        with st.expander("👀 查看即將執行的配對預覽"):
+            st.table(preview)
 
-        if st.button(f"確認指派這 {pair_count} 筆資料"):
+        if st.button(f"⚡ 立即執行 {pair_count} 筆指派並扣除庫存"):
             success_ids = []
-            bar = st.progress(0)
-            status = st.empty()
+            assign_prog = st.progress(0)
+            assign_status = st.empty()
 
             for i in range(pair_count):
-                target_id = pool[i]
-                target_name = missing_list[i]
-                status.info(f"正在指派 {target_id} -> {target_name}")
-                
-                if update_member_display_name(target_id, target_name):
-                    success_ids.append(target_id)
-                
-                bar.progress((i + 1) / pair_count)
-                time.sleep(0.1)
+                m_id, m_name = pool[i], missing_list[i]
+                assign_status.text(f"處理中: {m_id} -> {m_name}")
+                if update_member_display_name(m_id, m_name):
+                    success_ids.append(m_id)
+                assign_prog.progress((i + 1) / pair_count)
 
-            # --- 消耗彈藥庫 ---
-            # 從持久化池中移除成功的 ID
+            # 消耗庫存
             st.session_state.persistent_recycle_pool = [x for x in pool if x not in success_ids]
-            # 從本次未找到名單中移除已分配的人
-            res["missing"] = missing_list[pair_count:]
+            # 更新本次缺額名單 (移除已成功的)
+            st.session_state.search_results["missing"] = missing_list[len(success_ids):]
             
-            status.success(f"成功完成 {len(success_ids)} 筆指派！彈藥庫剩餘 {len(st.session_state.persistent_recycle_pool)} 個 ID。")
+            st.success(f"完成！成功回收指派 {len(success_ids)} 筆資料。")
             st.rerun()
     else:
-        st.warning("目前暫存池為空，或沒有需要指派的會員。")
+        st.warning("回收池無 ID 可用 或 沒有缺額需要指派。")
