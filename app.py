@@ -6,6 +6,7 @@ import requests
 import jwt  # from PyJWT
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from collections import defaultdict
 
 # ----------------------------
@@ -20,6 +21,10 @@ st.caption("自動移除輸入重複姓名、保留最新 PassKit ID、跨次暫
 # ----------------------------
 if "persistent_recycle_pool" not in st.session_state:
     st.session_state.persistent_recycle_pool = []
+
+if "persistent_missing_people" not in st.session_state:
+    # 會累積「尚未指派到 Passkit ID」的人名清單，直到你手動清空或完成指派後移除
+    st.session_state.persistent_missing_people = []
 
 if "search_results" not in st.session_state:
     st.session_state.search_results = {"all_rows": [], "missing": [], "search_done": False}
@@ -91,6 +96,44 @@ def update_member_display_name(member_id: str, new_name: str) -> bool:
 with st.sidebar:
     st.header("⚙️ 資源管理")
     st.metric("📦 可用回收 ID 庫存", len(st.session_state.persistent_recycle_pool))
+
+    # 一鍵複製「尚未指派」的 Passkit ID（回收庫存剩餘）
+    with st.expander('📋 未指派 Passkit ID（可一鍵複製）', expanded=False):
+        pool_ids = list(st.session_state.persistent_recycle_pool)
+        if pool_ids:
+            pool_text = '\n'.join(pool_ids)
+            st.caption('點下方按鈕即可把全部剩餘 ID 複製到剪貼簿（每行一個）。')
+            html_block = """
+                <div style='display:flex; gap:10px; align-items:center;'>
+                  <button id='copyPoolBtn' style='padding:8px 10px; border-radius:10px; border:1px solid #d1d5db; background:#fff; font-weight:600; cursor:pointer;'>📋 一鍵複製</button>
+                  <span id='copyPoolMsg' style='font-size:12px; color:#6b7280;'></span>
+                </div>
+                <script>
+                  (function(){
+                    const TEXT = __TEXT__;
+                    const btn = document.getElementById('copyPoolBtn');
+                    const msg = document.getElementById('copyPoolMsg');
+                    if(!btn) return;
+                    btn.addEventListener('click', async () => {
+                      try{
+                        await navigator.clipboard.writeText(TEXT);
+                        msg.textContent='已複製';
+                        setTimeout(()=>msg.textContent='', 1200);
+                      }catch(e){
+                        msg.textContent='複製失敗（瀏覽器限制）';
+                        setTimeout(()=>msg.textContent='', 2000);
+                      }
+                    });
+                  })();
+                </script>
+            """
+            components.html(
+                html_block.replace('__TEXT__', json.dumps(pool_text)),
+                height=62,
+            )
+            st.text_area('剩餘 ID（檢視用）', pool_text, height=140)
+        else:
+            st.info('目前沒有剩餘未指派 ID。')
     if st.button("🗑️ 清空所有 ID 庫存"):
         st.session_state.persistent_recycle_pool = []
         st.rerun()
@@ -155,7 +198,21 @@ if submitted:
     updated_pool.update(new_recycle_ids)
     st.session_state.persistent_recycle_pool = sorted(list(updated_pool))
 
-    st.session_state.search_results = {"all_rows": all_rows, "missing": missing, "search_done": True}
+    # 合併入「尚未指派」名單（不會因為再次檢查就被清掉）
+    if missing:
+        existing = list(st.session_state.persistent_missing_people)
+        seen = set(existing)
+        for nm in missing:
+            if nm not in seen:
+                existing.append(nm)
+                seen.add(nm)
+        st.session_state.persistent_missing_people = existing
+
+    st.session_state.search_results = {
+        "all_rows": all_rows,
+        "missing": list(st.session_state.persistent_missing_people),
+        "search_done": True,
+    }
     st.rerun()
 
 # ----------------------------
@@ -202,7 +259,12 @@ if res["search_done"]:
             # 消耗掉成功的 ID
             st.session_state.persistent_recycle_pool = [x for x in pool if x not in success_ids]
             # 移除已分配的缺額
-            st.session_state.search_results["missing"] = missing_list[len(success_ids):]
+            # 從「尚未指派」名單移除已成功指派的人名，剩下的會持續保留
+            assigned_names = set(missing_list[: len(success_ids)])
+            st.session_state.persistent_missing_people = [
+                nm for nm in st.session_state.persistent_missing_people if nm not in assigned_names
+            ]
+            st.session_state.search_results["missing"] = list(st.session_state.persistent_missing_people)
             
             st.success(f"指派成功！已為 {len(success_ids)} 位會員建立票卡，剩餘庫存 {len(st.session_state.persistent_recycle_pool)} 個。")
             st.rerun()
