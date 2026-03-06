@@ -18,10 +18,25 @@ st.set_page_config(page_title="PassKit 資源回收站 V2", page_icon="♻️", 
 st.title("♻️ PassKit 資源回收指派系統 (最新保留版)")
 
 # 回收門檻（以 UTC+0 today 計）
-months_label = st.selectbox("回收時間門檻（creationDate + cardIssueDate 都需超過）", ["三個月", "四個月", "五個月"], index=0)
+# Time filter（預設不套用；可選 3/4/5 個月或自訂）
+time_filter_option = st.selectbox(
+    "Time filter",
+    options=["不選擇（不套用）", "三個月", "四個月", "五個月", "自訂"],
+    index=0,
+    help="套用後，只會回收 meta.creationDate 距離現在（UTC+0）超過指定月數的卡號。預設不套用。"
+)
+
+custom_months = None
+if time_filter_option == "自訂":
+    custom_months = st.number_input("自訂月數（>=1）", min_value=1, max_value=60, value=3, step=1)
+
 MONTHS_MAP = {"三個月": 3, "四個月": 4, "五個月": 5}
-months_threshold = MONTHS_MAP.get(months_label, 3)
-require_modified_old = st.checkbox("同時要求 modified 也超過門檻（可選）", value=False)
+months_threshold = None
+if time_filter_option in MONTHS_MAP:
+    months_threshold = MONTHS_MAP[time_filter_option]
+elif time_filter_option == "自訂":
+    months_threshold = int(custom_months) if custom_months else 3
+
 st.caption("自動移除輸入重複姓名、保留最新 PassKit ID、跨次暫存回收資源。")
 
 # ----------------------------
@@ -239,23 +254,23 @@ if submitted:
             seen_ids.add(r["memberId"])
 
     # 按照搜尋姓名分組，保留最後一筆
-        member_groups = defaultdict(list)
+    member_groups = defaultdict(list)
     for r in unique_records:
         member_groups[r["搜尋姓名"]].append(r)
 
     def _eligible_for_recycle(rec: dict) -> bool:
-        c = _parse_any_date(rec.get("meta_creationDate"))
-        i = _parse_any_date(rec.get("meta_cardIssueDate"))
-        m = _parse_any_date(rec.get("modified"))
-
-        # 必須 creationDate 與 cardIssueDate 兩者都 >= 門檻
-        ok_both = _is_older_than_months(c, months_threshold) and _is_older_than_months(i, months_threshold)
-        if not ok_both:
+        """Return True if this record is eligible to recycle under current time filter."""
+        # 未選擇 time filter → 不做自動回收
+        if months_threshold is None:
             return False
 
-        # 可選：同時要求 modified 也 >= 門檻
-        if require_modified_old:
-            return _is_older_than_months(m, months_threshold)
+        c = _parse_any_date(rec.get("meta_creationDate"))
+        if not c:
+            return False
+
+        # meta.creationDate 必須距離現在（UTC+0）超過指定月數
+        if not _is_older_than_months(c, months_threshold):
+            return False
 
         return True
 
@@ -282,7 +297,7 @@ if submitted:
                     "creationDate": rec.get("meta_creationDate", ""),
                     "cardIssueDate": rec.get("meta_cardIssueDate", ""),
                     "modified": rec.get("modified", ""),
-                    "原因": f"同名重複 + {months_label}以上（兩日期皆符合）" + (" + modified符合" if require_modified_old else ""),
+                    "原因": f"同名重複 + creationDate 超過 {months_threshold} 個月（UTC+0）",
                 })
 # 合併入持久化彈彈藥庫
     updated_pool = set(st.session_state.persistent_recycle_pool)
