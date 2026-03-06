@@ -8,12 +8,20 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from collections import defaultdict
+import re
+import datetime
 
 # ----------------------------
 # Page Config
 # ----------------------------
 st.set_page_config(page_title="PassKit 資源回收站 V2", page_icon="♻️", layout="wide")
 st.title("♻️ PassKit 資源回收指派系統 (最新保留版)")
+
+# 回收門檻（以 UTC+0 today 計）
+months_label = st.selectbox("回收時間門檻（creationDate + cardIssueDate 都需超過）", ["三個月", "四個月", "五個月"], index=0)
+MONTHS_MAP = {"三個月": 3, "四個月": 4, "五個月": 5}
+months_threshold = MONTHS_MAP.get(months_label, 3)
+require_modified_old = st.checkbox("同時要求 modified 也超過門檻（可選）", value=False)
 st.caption("自動移除輸入重複姓名、保留最新 PassKit ID、跨次暫存回收資源。")
 
 # ----------------------------
@@ -50,6 +58,55 @@ def make_jwt_for_body(body_text: str) -> str:
     token = jwt.encode(payload, PK_API_SECRET, algorithm="HS256")
     return token.decode("utf-8") if isinstance(token, bytes) else token
 
+# ----------------------------
+# Date helpers (UTC)
+# ----------------------------
+def _parse_any_date(s: str):
+    """Parse various date formats used in meta/fields.
+    Returns a datetime.date or None.
+    """
+    if not s:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+
+    if re.fullmatch(r"\d{6}", s):
+        try:
+            return datetime.datetime.strptime(s, "%d%m%y").date()
+        except Exception:
+            pass
+
+    for fmt in ("%d %b %Y", "%d %B %Y", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+
+    try:
+        ss = s.replace("Z", "+00:00")
+        return datetime.datetime.fromisoformat(ss).date()
+    except Exception:
+        return None
+
+
+def _utc_today() -> datetime.date:
+    return datetime.datetime.now(datetime.timezone.utc).date()
+
+
+def _cutoff_date_months_ago(months: int) -> datetime.date:
+    try:
+        from dateutil.relativedelta import relativedelta
+        return (_utc_today() - relativedelta(months=months))
+    except Exception:
+        return (_utc_today() - datetime.timedelta(days=30 * months))
+
+
+def _is_older_than_months(d: datetime.date | None, months: int) -> bool:
+    if d is None:
+        return False
+    return d <= _cutoff_date_months_ago(months)
+
 def post_list_members(filters_payload: dict) -> list[dict]:
     url = f"{PK_API_PREFIX.rstrip('/')}/members/member/list/{PROGRAM_ID}"
     body_text = json.dumps({"filters": filters_payload}, separators=(",", ":"), ensure_ascii=False)
@@ -79,7 +136,7 @@ def search_by_display_name(name: str, max_hits: int, operator: str) -> list[dict
         d_name = (person.get("displayName") or "").strip()
         m_id = (member.get("id") or "").strip()
         if d_name and m_id:
-            rows.append({"搜尋姓名": name, "displayName": d_name, "memberId": m_id})
+            rows.append({"搜尋姓名": name, "displayName": d_name, "memberId": m_id, "created": member.get("created",""), "modified": member.get("modified",""), "meta_creationDate": (member.get("metaData", {}) or {}).get("creationDate",""), "meta_cardIssueDate": (member.get("metaData", {}) or {}).get("cardIssueDate","")})
     return rows # 這裡回傳完整列表，稍後再依順序處理
 
 def update_member_display_name(member_id: str, new_name: str) -> bool:
@@ -182,18 +239,52 @@ if submitted:
             seen_ids.add(r["memberId"])
 
     # 按照搜尋姓名分組，保留最後一筆
-    member_groups = defaultdict(list)
+        member_groups = defaultdict(list)
     for r in unique_records:
-        member_groups[r["搜尋姓名"]].append(r["memberId"])
+        member_groups[r["搜尋姓名"]].append(r)
+
+    def _eligible_for_recycle(rec: dict) -> bool:
+        c = _parse_any_date(rec.get("meta_creationDate"))
+        i = _parse_any_date(rec.get("meta_cardIssueDate"))
+        m = _parse_any_date(rec.get("modified"))
+
+        # 必須 creationDate 與 cardIssueDate 兩者都 >= 門檻
+        ok_both = _is_older_than_months(c, months_threshold) and _is_older_than_months(i, months_threshold)
+        if not ok_both:
+            return False
+
+        # 可選：同時要求 modified 也 >= 門檻
+        if require_modified_old:
+            return _is_older_than_months(m, months_threshold)
+
+        return True
 
     new_recycle_ids = []
-    for s_name, ids in member_groups.items():
-        if len(ids) > 1:
-            # 例如 YUMIN LEE 有 [ID_0, ID_1]，ID_1 是最後一筆 (最新)
-            to_recycle = ids[:-1]  # 取除了最後一個以外的所有 ID
-            new_recycle_ids.extend(to_recycle)
+    new_recycle_details = []
 
-    # 合併入持久化彈彈藥庫
+    for s_name, recs in member_groups.items():
+        if len(recs) <= 1:
+            continue
+
+        # 例如 YUMIN LEE 有 [ID_0, ID_1]，ID_1 是最後一筆 (最新)
+        to_recycle = recs[:-1]  # 取除了最後一個以外的所有候選
+
+        for rec in to_recycle:
+            mid = rec.get("memberId", "")
+            if not mid:
+                continue
+
+            if _eligible_for_recycle(rec):
+                new_recycle_ids.append(mid)
+                new_recycle_details.append({
+                    "搜尋姓名": s_name,
+                    "回收memberId": mid,
+                    "creationDate": rec.get("meta_creationDate", ""),
+                    "cardIssueDate": rec.get("meta_cardIssueDate", ""),
+                    "modified": rec.get("modified", ""),
+                    "原因": f"同名重複 + {months_label}以上（兩日期皆符合）" + (" + modified符合" if require_modified_old else ""),
+                })
+# 合併入持久化彈彈藥庫
     updated_pool = set(st.session_state.persistent_recycle_pool)
     updated_pool.update(new_recycle_ids)
     st.session_state.persistent_recycle_pool = sorted(list(updated_pool))
