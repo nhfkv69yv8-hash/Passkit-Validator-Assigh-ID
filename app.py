@@ -1,28 +1,15 @@
 import os
-import re
+import time
 import json
-import datetime
-from pathlib import Path
-from collections import defaultdict
-
+import hashlib
+import requests
+import jwt  # from PyJWT
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
-
-try:
-    import grpc
-    from passkit.io.common import common_objects_pb2, filter_pb2
-    from passkit.io.member import a_rpc_pb2_grpc, member_pb2
-except Exception as e:
-    grpc = None
-    common_objects_pb2 = None
-    filter_pb2 = None
-    a_rpc_pb2_grpc = None
-    member_pb2 = None
-    SDK_IMPORT_ERROR = e
-else:
-    SDK_IMPORT_ERROR = None
-
+from collections import defaultdict
+import re
+import datetime
 
 # ----------------------------
 # Page Config
@@ -36,7 +23,7 @@ time_filter_option = st.selectbox(
     "Time filter",
     options=["不選擇（不套用）", "三個月", "四個月", "五個月", "自訂"],
     index=0,
-    help="套用後，只會回收 meta.creationDate 距離現在（UTC+0）超過指定月數的卡號。預設不套用。",
+    help="套用後，只會回收 meta.creationDate 距離現在（UTC+0）超過指定月數的卡號。預設不套用。"
 )
 
 custom_months = None
@@ -59,106 +46,40 @@ if "persistent_recycle_pool" not in st.session_state:
     st.session_state.persistent_recycle_pool = []
 
 if "persistent_missing_people" not in st.session_state:
+    # 會累積「尚未指派到 Passkit ID」的人名清單，直到你手動清空或完成指派後移除
     st.session_state.persistent_missing_people = []
 
 if "search_results" not in st.session_state:
-    st.session_state.search_results = {"all_rows": [], "missing": [], "search_done": False}
-
+    st.session_state.search_results = {
+        "all_rows": [],
+        "missing": [],
+        "search_done": False,
+        "debug": [],
+        "recycle_details": [],
+    }
 
 # ----------------------------
-# Config & gRPC Helpers
+# Config & API Helpers (核心函式)
 # ----------------------------
-def get_config(key: str, default=None):
+def get_config(key: str, default: str | None = None) -> str | None:
     val = st.secrets.get(key) if hasattr(st, "secrets") else None
     if val is None:
         val = os.environ.get(key, default)
-    if val is None:
-        return None
-    return str(val).replace("\\n", "\n").strip()
+    return str(val).replace("\\n", "\n").strip() if val else None
 
-
-def normalize_name(name: str) -> str:
-    return re.sub(r"\s+", " ", (name or "").strip()).upper()
-
-
-PROGRAM_ID = get_config("PROGRAM_ID")
+PK_API_KEY = get_config("PK_API_KEY")
+PK_API_SECRET = get_config("PK_API_SECRET")
 PK_API_PREFIX = get_config("PK_API_PREFIX", "https://api.pub1.passkit.io")
-PK_GRPC_HOST = (
-    get_config("PK_GRPC_HOST")
-    or get_config("PASSKIT_GRPC_HOST")
-    or get_config("GRPC_HOST")
-)
-if not PK_GRPC_HOST:
-    if "pub2" in (PK_API_PREFIX or ""):
-        PK_GRPC_HOST = "grpc.pub2.passkit.io:443"
-    else:
-        PK_GRPC_HOST = "grpc.pub1.passkit.io:443"
+PROGRAM_ID = get_config("PROGRAM_ID")
 
 
-def _load_secret_or_file(content_keys, path_keys, default_paths=None):
-    for key in content_keys:
-        value = get_config(key)
-        if value:
-            return value.encode("utf-8")
-
-    for key in path_keys:
-        path_value = get_config(key)
-        if path_value and Path(path_value).exists():
-            return Path(path_value).read_bytes()
-
-    for p in (default_paths or []):
-        if p and Path(p).exists():
-            return Path(p).read_bytes()
-    return None
-
-
-CERT_PEM = _load_secret_or_file(
-    ["PASSKIT_CERTIFICATE_PEM", "CERTIFICATE_PEM", "PK_CERTIFICATE_PEM"],
-    ["PASSKIT_CERTIFICATE_PEM_PATH", "CERTIFICATE_PEM_PATH", "PK_CERTIFICATE_PEM_PATH"],
-    ["certs/certificate.pem", "./certs/certificate.pem", "/app/certs/certificate.pem"],
-)
-CA_CHAIN_PEM = _load_secret_or_file(
-    ["PASSKIT_CA_CHAIN_PEM", "CA_CHAIN_PEM", "PK_CA_CHAIN_PEM"],
-    ["PASSKIT_CA_CHAIN_PEM_PATH", "CA_CHAIN_PEM_PATH", "PK_CA_CHAIN_PEM_PATH"],
-    ["certs/ca-chain.pem", "./certs/ca-chain.pem", "/app/certs/ca-chain.pem"],
-)
-KEY_PEM = _load_secret_or_file(
-    ["PASSKIT_KEY_PEM", "KEY_PEM", "PK_KEY_PEM"],
-    ["PASSKIT_KEY_PEM_PATH", "KEY_PEM_PATH", "PK_KEY_PEM_PATH"],
-    ["certs/key.pem", "./certs/key.pem", "/app/certs/key.pem"],
-)
-
-
-def _grpc_config_error() -> str | None:
-    if SDK_IMPORT_ERROR:
-        return f"PassKit gRPC SDK 載入失敗：{SDK_IMPORT_ERROR}"
-    if not PROGRAM_ID:
-        return "缺少 PROGRAM_ID 設定。"
-    if not PK_GRPC_HOST:
-        return "缺少 PassKit gRPC host 設定。"
-    if not CERT_PEM:
-        return "找不到 certificate.pem。"
-    if not CA_CHAIN_PEM:
-        return "找不到 ca-chain.pem。"
-    if not KEY_PEM:
-        return "找不到 key.pem（需先用 openssl 解密後再使用）。"
-    return None
-
-
-@st.cache_resource(show_spinner=False)
-def get_members_stub():
-    err = _grpc_config_error()
-    if err:
-        raise RuntimeError(err)
-
-    creds = grpc.ssl_channel_credentials(
-        root_certificates=CA_CHAIN_PEM,
-        private_key=KEY_PEM,
-        certificate_chain=CERT_PEM,
-    )
-    channel = grpc.secure_channel(PK_GRPC_HOST, creds)
-    return a_rpc_pb2_grpc.MembersStub(channel)
-
+def make_jwt_for_body(body_text: str) -> str:
+    now = int(time.time())
+    payload = {"uid": PK_API_KEY, "iat": now, "exp": now + 600}
+    if body_text:
+        payload["signature"] = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
+    token = jwt.encode(payload, PK_API_SECRET, algorithm="HS256")
+    return token.decode("utf-8") if isinstance(token, bytes) else token
 
 # ----------------------------
 # Date helpers (UTC)
@@ -192,6 +113,26 @@ def _parse_any_date(s: str):
         return None
 
 
+def _parse_any_datetime(s: str):
+    if not s:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    try:
+        ss = s.replace("Z", "+00:00")
+        dt = datetime.datetime.fromisoformat(ss)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except Exception:
+        pass
+    d = _parse_any_date(s)
+    if d is not None:
+        return datetime.datetime.combine(d, datetime.time.min, tzinfo=datetime.timezone.utc)
+    return None
+
+
 def _utc_today() -> datetime.date:
     return datetime.datetime.now(datetime.timezone.utc).date()
 
@@ -199,10 +140,9 @@ def _utc_today() -> datetime.date:
 def _cutoff_date_months_ago(months: int) -> datetime.date:
     try:
         from dateutil.relativedelta import relativedelta
-
-        return _utc_today() - relativedelta(months=months)
+        return (_utc_today() - relativedelta(months=months))
     except Exception:
-        return _utc_today() - datetime.timedelta(days=30 * months)
+        return (_utc_today() - datetime.timedelta(days=30 * months))
 
 
 def _is_older_than_months(d: datetime.date | None, months: int) -> bool:
@@ -211,94 +151,124 @@ def _is_older_than_months(d: datetime.date | None, months: int) -> bool:
     return d <= _cutoff_date_months_ago(months)
 
 
-def _timestamp_to_iso(ts) -> str:
-    try:
-        if ts is None:
-            return ""
-        if hasattr(ts, "seconds") and ts.seconds == 0 and getattr(ts, "nanos", 0) == 0:
-            return ""
-        dt = ts.ToDatetime()
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-        return dt.astimezone(datetime.timezone.utc).isoformat()
-    except Exception:
-        return ""
+def _normalize_name(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip()).upper()
 
 
-def _member_meta_to_dict(member) -> dict:
-    try:
-        return dict(getattr(member, "metaData", {}) or {})
-    except Exception:
-        return {}
+def _extract_member_objects(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("results", "result", "items", "members", "data"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                return val
+            if isinstance(val, dict):
+                return [val]
+        return [payload]
+    return []
 
 
-def _member_to_row(search_name: str, member) -> dict | None:
-    if not member:
-        return None
+def post_list_members(filters_payload: dict):
+    url = f"{PK_API_PREFIX.rstrip('/')}/members/member/list/{PROGRAM_ID}"
+    body_text = json.dumps({"filters": filters_payload}, separators=(",", ":"), ensure_ascii=False)
+    headers = {"Authorization": make_jwt_for_body(body_text), "Content-Type": "application/json"}
+    resp = requests.post(url, headers=headers, data=body_text, timeout=30)
 
-    person = getattr(member, "person", None)
-    d_name = ""
-    if person is not None:
-        d_name = (getattr(person, "displayName", "") or "").strip()
-
-    m_id = (getattr(member, "id", "") or "").strip()
-    if not d_name or not m_id:
-        return None
-
-    meta = _member_meta_to_dict(member)
-    return {
-        "搜尋姓名": search_name,
-        "displayName": d_name,
-        "memberId": m_id,
-        "created": _timestamp_to_iso(getattr(member, "created", None)),
-        "modified": _timestamp_to_iso(getattr(member, "updated", None)),
-        "meta_creationDate": meta.get("creationDate", ""),
-        "meta_cardIssueDate": meta.get("cardIssueDate", ""),
+    debug = {
+        "url": url,
+        "status_code": resp.status_code,
+        "ok": resp.ok,
+        "error": "",
+        "count": 0,
     }
 
+    if not resp.ok:
+        debug["error"] = (resp.text or "")[:500]
+        return [], debug
 
-def search_by_display_name(name: str, max_hits: int, operator: str) -> list[dict]:
-    stub = get_members_stub()
-    normalized_name = normalize_name(name)
+    text = (resp.text or "").strip()
+    if not text:
+        return [], debug
 
-    req = member_pb2.ListRequest(
-        programId=PROGRAM_ID,
-        filters=filter_pb2.Filters(
-            limit=min(int(max_hits), 1000),
-            offset=0,
-            filterGroups=[
-                filter_pb2.FilterGroup(
-                    condition=filter_pb2.AND,
-                    fieldFilters=[
-                        filter_pb2.FieldFilter(
-                            filterField="displayName",
-                            filterValue=normalized_name,
-                            filterOperator=operator,
-                        )
-                    ],
-                )
-            ],
-        ),
+    parsed_items = []
+
+    # 單一 JSON
+    try:
+        payload = resp.json()
+        parsed_items = _extract_member_objects(payload)
+    except Exception:
+        # NDJSON / 多行 JSON fallback
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        for ln in lines:
+            try:
+                parsed_items.extend(_extract_member_objects(json.loads(ln)))
+            except Exception:
+                parsed_items = []
+                debug["error"] = "response JSON parse failed"
+                break
+
+    debug["count"] = len(parsed_items)
+    return parsed_items, debug
+
+
+def _member_sort_key(rec: dict):
+    return (
+        _parse_any_datetime(rec.get("created"))
+        or _parse_any_datetime(rec.get("modified"))
+        or _parse_any_datetime(rec.get("meta_creationDate"))
+        or _parse_any_datetime(rec.get("meta_cardIssueDate"))
+        or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
     )
 
+
+def search_by_display_name(name: str, max_hits: int, operator: str):
+    query_name = _normalize_name(name) if operator == "eq" else name.strip()
+    filters = {
+        "limit": min(max_hits, 1000),
+        "offset": 0,
+        "orderBy": "created",
+        "orderAsc": True,
+        "filterGroups": [{
+            "condition": "AND",
+            "fieldFilters": [{
+                "filterField": "displayName",
+                "filterValue": query_name,
+                "filterOperator": operator,
+            }]
+        }]
+    }
+    items, debug = post_list_members(filters)
     rows = []
-    for member in stub.listMembers(req):
-        row = _member_to_row(name, member)
-        if row:
-            rows.append(row)
-    return rows
+    for item in items:
+        member = item.get("result") or item.get("member") or item
+        if not isinstance(member, dict):
+            continue
+        person = member.get("person") or {}
+        d_name = (person.get("displayName") or "").strip()
+        m_id = (member.get("id") or "").strip()
+        if d_name and m_id:
+            rows.append({
+                "搜尋姓名": name,
+                "displayName": d_name,
+                "memberId": m_id,
+                "created": member.get("created", ""),
+                "modified": member.get("modified", ""),
+                "meta_creationDate": (member.get("metaData", {}) or {}).get("creationDate", ""),
+                "meta_cardIssueDate": (member.get("metaData", {}) or {}).get("cardIssueDate", ""),
+            })
+    rows.sort(key=_member_sort_key)
+    debug["search_name"] = name
+    return rows, debug
 
 
 def update_member_display_name(member_id: str, new_name: str) -> bool:
-    stub = get_members_stub()
-    member = stub.getMemberRecordById(common_objects_pb2.Id(id=member_id))
-    if not getattr(member, "id", ""):
-        return False
-
-    member.person.displayName = normalize_name(new_name)
-    resp = stub.updateMember(member)
-    return bool(getattr(resp, "id", ""))
-
+    url = f"{PK_API_PREFIX.rstrip('/')}/members/member"
+    payload = {"id": member_id, "person": {"displayName": new_name}}
+    body_text = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    headers = {"Authorization": make_jwt_for_body(body_text), "Content-Type": "application/json"}
+    resp = requests.put(url, headers=headers, data=body_text, timeout=30)
+    return resp.ok
 
 # ----------------------------
 # UI 控制面板
@@ -307,17 +277,12 @@ with st.sidebar:
     st.header("⚙️ 資源管理")
     st.metric("📦 可用回收 ID 庫存", len(st.session_state.persistent_recycle_pool))
 
-    grpc_err = _grpc_config_error()
-    if grpc_err:
-        st.error(f"gRPC 設定未完成：{grpc_err}")
-    else:
-        st.caption(f"gRPC Host：{PK_GRPC_HOST}")
-
-    with st.expander("📋 未指派 Passkit ID（可一鍵複製）", expanded=False):
+    # 一鍵複製「尚未指派」的 Passkit ID（回收庫存剩餘）
+    with st.expander('📋 未指派 Passkit ID（可一鍵複製）', expanded=False):
         pool_ids = list(st.session_state.persistent_recycle_pool)
         if pool_ids:
-            pool_text = "\n".join(pool_ids)
-            st.caption("點下方按鈕即可把全部剩餘 ID 複製到剪貼簿（每行一個）。")
+            pool_text = '\n'.join(pool_ids)
+            st.caption('點下方按鈕即可把全部剩餘 ID 複製到剪貼簿（每行一個）。')
             html_block = """
                 <div style='display:flex; gap:10px; align-items:center;'>
                   <button id='copyPoolBtn' style='padding:8px 10px; border-radius:10px; border:1px solid #d1d5db; background:#fff; font-weight:600; cursor:pointer;'>📋 一鍵複製</button>
@@ -343,13 +308,12 @@ with st.sidebar:
                 </script>
             """
             components.html(
-                html_block.replace("__TEXT__", json.dumps(pool_text)),
+                html_block.replace('__TEXT__', json.dumps(pool_text)),
                 height=62,
             )
-            st.text_area("剩餘 ID（檢視用）", pool_text, height=140)
+            st.text_area('剩餘 ID（檢視用）', pool_text, height=140)
         else:
-            st.info("目前沒有剩餘未指派 ID。")
-
+            st.info('目前沒有剩餘未指派 ID。')
     if st.button("🗑️ 清空所有 ID 庫存"):
         st.session_state.persistent_recycle_pool = []
         st.rerun()
@@ -361,16 +325,10 @@ with st.form("search_form"):
     operator = colB.selectbox("比對方式", ["eq", "like"])
     submitted = st.form_submit_button("🔍 開始搜尋並過濾重複名單")
 
-
 # ----------------------------
 # 搜尋邏輯
 # ----------------------------
 if submitted:
-    grpc_err = _grpc_config_error()
-    if grpc_err:
-        st.error(f"無法執行查詢：{grpc_err}")
-        st.stop()
-
     raw_names = [n.strip() for n in (input_text or "").splitlines() if n.strip()]
     names = list(dict.fromkeys(raw_names))
 
@@ -381,68 +339,69 @@ if submitted:
         st.warning("請輸入姓名")
         st.stop()
 
-    all_rows, missing = [], []
+    all_rows, missing, debug_rows = [], [], []
     prog = st.progress(0)
     status_txt = st.empty()
 
     for i, name in enumerate(names):
         status_txt.text(f"查詢中 ({i+1}/{len(names)}): {name}")
         try:
-            rows = search_by_display_name(name, max_hits=int(max_hits), operator=operator)
+            rows, dbg = search_by_display_name(name, max_hits=int(max_hits), operator=operator)
+            debug_rows.append(dbg)
             if rows:
                 all_rows.extend(rows)
             else:
                 missing.append(name)
         except Exception as e:
+            debug_rows.append({"search_name": name, "status_code": None, "ok": False, "count": 0, "error": str(e)})
             st.error(f"查詢出錯: {name} -> {e}")
         prog.progress((i + 1) / len(names))
 
     unique_records = []
     seen_ids = set()
     for r in all_rows:
-        mid = r.get("memberId", "")
-        if mid and mid not in seen_ids:
+        if r["memberId"] not in seen_ids:
             unique_records.append(r)
-            seen_ids.add(mid)
+            seen_ids.add(r["memberId"])
 
     member_groups = defaultdict(list)
     for r in unique_records:
         member_groups[r["搜尋姓名"]].append(r)
 
-    def _sort_key(rec: dict):
-        created_dt = _parse_any_date(rec.get("created")) or datetime.date.min
-        modified_dt = _parse_any_date(rec.get("modified")) or datetime.date.min
-        return (created_dt, modified_dt, rec.get("memberId", ""))
-
     def _eligible_for_recycle(rec: dict) -> bool:
         if months_threshold is None:
             return False
-
         c = _parse_any_date(rec.get("meta_creationDate"))
         if not c:
             return False
-
         if not _is_older_than_months(c, months_threshold):
             return False
-
         return True
 
     new_recycle_ids = []
+    new_recycle_details = []
 
-    for _, recs in member_groups.items():
+    for s_name, recs in member_groups.items():
         if len(recs) <= 1:
             continue
 
-        recs_sorted = sorted(recs, key=_sort_key)
-        to_recycle = recs_sorted[:-1]
+        recs = sorted(recs, key=_member_sort_key)
+        to_recycle = recs[:-1]
 
         for rec in to_recycle:
             mid = rec.get("memberId", "")
             if not mid:
                 continue
-
             if _eligible_for_recycle(rec):
                 new_recycle_ids.append(mid)
+                new_recycle_details.append({
+                    "搜尋姓名": s_name,
+                    "回收memberId": mid,
+                    "creationDate": rec.get("meta_creationDate", ""),
+                    "cardIssueDate": rec.get("meta_cardIssueDate", ""),
+                    "modified": rec.get("modified", ""),
+                    "原因": f"同名重複 + creationDate 超過 {months_threshold} 個月（UTC+0）",
+                })
 
     updated_pool = set(st.session_state.persistent_recycle_pool)
     updated_pool.update(new_recycle_ids)
@@ -461,9 +420,10 @@ if submitted:
         "all_rows": all_rows,
         "missing": list(st.session_state.persistent_missing_people),
         "search_done": True,
+        "debug": debug_rows,
+        "recycle_details": new_recycle_details,
     }
     st.rerun()
-
 
 # ----------------------------
 # 執行與預覽
@@ -478,6 +438,14 @@ if res["search_done"]:
     with col2:
         st.markdown(f"**❓ 本次缺額：{len(res['missing'])} 人**")
         st.write(", ".join(res["missing"]) if res["missing"] else "無缺額")
+
+    if res.get("recycle_details"):
+        with st.expander("♻️ 本次新加入回收池明細", expanded=False):
+            st.dataframe(pd.DataFrame(res["recycle_details"]), use_container_width=True)
+
+    if res.get("debug"):
+        with st.expander("🛠️ 查詢偵錯摘要", expanded=False):
+            st.dataframe(pd.DataFrame(res["debug"]), use_container_width=True)
 
     st.markdown("---")
     st.subheader("🚀 資源回收指派 (最新 ID 已保留)")
@@ -496,29 +464,26 @@ if res["search_done"]:
 
         if st.button(f"⚡ 確定指派這 {pair_count} 筆"):
             success_ids = []
+            success_names = []
             assign_prog = st.progress(0)
             assign_status = st.empty()
 
             for i in range(pair_count):
                 m_id, m_name = pool[i], missing_list[i]
                 assign_status.text(f"正在更新: {m_id} -> {m_name}")
-                try:
-                    if update_member_display_name(m_id, m_name):
-                        success_ids.append(m_id)
-                except Exception as e:
-                    st.error(f"更新失敗: {m_id} -> {m_name} | {e}")
+                if update_member_display_name(m_id, m_name):
+                    success_ids.append(m_id)
+                    success_names.append(m_name)
                 assign_prog.progress((i + 1) / pair_count)
 
             st.session_state.persistent_recycle_pool = [x for x in pool if x not in success_ids]
-            assigned_names = set(missing_list[: len(success_ids)])
+            assigned_names = set(success_names)
             st.session_state.persistent_missing_people = [
                 nm for nm in st.session_state.persistent_missing_people if nm not in assigned_names
             ]
             st.session_state.search_results["missing"] = list(st.session_state.persistent_missing_people)
 
-            st.success(
-                f"指派成功！已為 {len(success_ids)} 位會員建立票卡，剩餘庫存 {len(st.session_state.persistent_recycle_pool)} 個。"
-            )
+            st.success(f"指派成功！已為 {len(success_ids)} 位會員建立票卡，剩餘庫存 {len(st.session_state.persistent_recycle_pool)} 個。")
             st.rerun()
     else:
         st.warning("暫無可用資源或無缺額需要指派。")
