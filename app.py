@@ -37,7 +37,7 @@ if time_filter_option in MONTHS_MAP:
 elif time_filter_option == "自訂":
     months_threshold = int(custom_months) if custom_months else 3
 
-st.caption("自動移除輸入重複姓名、保留最新 PassKit ID、跨次暫存回收資源。")
+st.caption("自動移除輸入重複姓名、保留最新 PassKit ID、跨次暫存回收資源。預設會保留最後一筆（最新）memberId；只有選了 Time filter 才會再套用 creationDate 回收門檻。")
 
 # ----------------------------
 # Session State 初始化
@@ -378,8 +378,9 @@ if submitted:
         member_groups[r["搜尋姓名"]].append(r)
 
     def _eligible_for_recycle(rec: dict) -> bool:
+        # 預設不套用時間門檻時：所有重複舊卡都可回收。
         if months_threshold is None:
-            return False
+            return True
         c = _parse_any_date(rec.get("meta_creationDate"))
         if not c:
             return False
@@ -410,7 +411,11 @@ if submitted:
                     "creationDate": rec.get("meta_creationDate", ""),
                     "cardIssueDate": rec.get("meta_cardIssueDate", ""),
                     "modified": rec.get("modified", ""),
-                    "原因": f"同名重複 + creationDate 超過 {months_threshold} 個月（UTC+0）",
+                    "原因": (
+                        f"同名重複，依建立時間排序保留最新 memberId；creationDate 超過 {months_threshold} 個月（UTC+0）"
+                        if months_threshold is not None
+                        else "同名重複，依建立時間排序保留最新 memberId"
+                    ),
                 })
 
     updated_pool = set(st.session_state.persistent_recycle_pool)
