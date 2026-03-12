@@ -176,11 +176,13 @@ def post_list_members(filters_payload: dict):
     resp = requests.post(url, headers=headers, data=body_text, timeout=30)
 
     debug = {
-        "url": url,
+        "query_endpoint": url,
+        "program_id": PROGRAM_ID,
         "status_code": resp.status_code,
         "ok": resp.ok,
         "error": "",
         "count": 0,
+        "matched_member_ids": [],
     }
 
     if not resp.ok:
@@ -259,6 +261,13 @@ def search_by_display_name(name: str, max_hits: int, operator: str):
             })
     rows.sort(key=_member_sort_key)
     debug["search_name"] = name
+    debug["matched_member_ids"] = [r["memberId"] for r in rows]
+    if rows:
+        debug["kept_member_id"] = rows[-1]["memberId"]
+        debug["recycled_member_ids"] = [r["memberId"] for r in rows[:-1]]
+    else:
+        debug["kept_member_id"] = ""
+        debug["recycled_member_ids"] = []
     return rows, debug
 
 
@@ -396,6 +405,7 @@ if submitted:
                 new_recycle_ids.append(mid)
                 new_recycle_details.append({
                     "搜尋姓名": s_name,
+                    "保留memberId": recs[-1].get("memberId", ""),
                     "回收memberId": mid,
                     "creationDate": rec.get("meta_creationDate", ""),
                     "cardIssueDate": rec.get("meta_cardIssueDate", ""),
@@ -445,7 +455,15 @@ if res["search_done"]:
 
     if res.get("debug"):
         with st.expander("🛠️ 查詢偵錯摘要", expanded=False):
-            st.dataframe(pd.DataFrame(res["debug"]), use_container_width=True)
+            dbg_df = pd.DataFrame(res["debug"])
+            if not dbg_df.empty:
+                preferred_cols = [
+                    "search_name", "program_id", "query_endpoint", "status_code", "ok", "count",
+                    "matched_member_ids", "kept_member_id", "recycled_member_ids", "error"
+                ]
+                ordered_cols = [c for c in preferred_cols if c in dbg_df.columns] + [c for c in dbg_df.columns if c not in preferred_cols]
+                dbg_df = dbg_df[ordered_cols]
+            st.dataframe(dbg_df, use_container_width=True)
 
     st.markdown("---")
     st.subheader("🚀 資源回收指派 (最新 ID 已保留)")
