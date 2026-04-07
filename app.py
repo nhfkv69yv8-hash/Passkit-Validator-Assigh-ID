@@ -253,10 +253,10 @@ def search_by_display_name(name: str, max_hits: int, operator: str):
             rows.append({
                 "搜尋姓名": name,
                 "displayName": d_name,
+                "meta_creationDate": (member.get("metaData", {}) or {}).get("creationDate", ""),
                 "memberId": m_id,
                 "created": member.get("created", ""),
                 "modified": member.get("modified", ""),
-                "meta_creationDate": (member.get("metaData", {}) or {}).get("creationDate", ""),
                 "meta_cardIssueDate": (member.get("metaData", {}) or {}).get("cardIssueDate", ""),
             })
     rows.sort(key=_member_sort_key)
